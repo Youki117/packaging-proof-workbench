@@ -9,16 +9,28 @@
 </head>
 <body>
   <a class="skip" href="#viewer">跳到包装原稿</a>
-  <header class="topbar" title="包装审查工作台 0.4.11">
-    <div class="brand"><h1>包装审查工作台</h1><p id="case-name">正在打开稿件</p></div>
+  <header class="topbar" title="包装审查工作台 0.5.0">
+    <div class="brand">
+      <div class="brand-row">
+        <h1>包装审查工作台</h1>
+        <select id="category-select" class="category-select" aria-label="审查品类" title="切换普通食品或宠物饲料审查规则与目录">
+          <option value="auto">品类：自动识别</option>
+          <option value="food">品类：普通食品</option>
+          <option value="pet">品类：宠物饲料</option>
+        </select>
+      </div>
+      <p id="case-name">正在打开稿件</p>
+    </div>
     <div class="top-actions">
-      <div class="tool-group" role="group" aria-label="打开稿件">
-        <button id="open-files" title="请选择用于回稿的完整展开图或 PDF">导入完整稿</button>
-        <button id="open-formula" type="button" title="关联 XLSX 或配方表图片，对照包装的每克活菌数" disabled>关联配方表</button>
+      <div class="tool-group" role="group" aria-label="打开与管理稿件">
+        <button id="open-projects" type="button" title="切换历史稿件、重命名、删除或导入导出工程备份">稿件 <span id="project-count">1</span></button>
+        <button id="open-files" title="导入新稿件（PNG、JPG 或 PDF），自动建新项目不覆盖旧稿">导入完整稿</button>
+        <button id="open-formula" type="button" title="关联 XLSX（活菌数或通用配料表）或配方表图片" disabled>关联配方表</button>
         <button id="load-sample" hidden>打开样稿</button>
       </div>
       <input id="files" type="file" accept=".png,.jpg,.jpeg,.pdf" multiple hidden>
       <input id="formula-file" type="file" accept=".xlsx,.png,.jpg,.jpeg" hidden>
+      <input id="bundle-file" type="file" accept=".json,.workbench.json" hidden>
       <div class="tool-group" role="group" aria-label="AI 审查">
         <button id="preflight" disabled>开始 AI 预审</button>
         <button id="ai-review" hidden>AI 复核本页</button>
@@ -69,6 +81,7 @@
         <span id="formula-state" role="status"></span>
         <button id="retry-ocr" hidden>重试识别本页</button>
         <span id="ai-state" role="status"></span>
+        <span id="model-badge" role="status"></span>
         <span id="processing" role="status" hidden></span>
         <span id="saved" role="status"></span>
         <span id="zoom-level">适合窗口</span>
@@ -144,7 +157,7 @@
           <p id="catalog-hint">多个名称用顿号、逗号或换行分隔。</p>
           <button id="catalog-search" type="submit" class="primary">查名称</button>
         </form>
-        <details id="food-catalog-scope" class="catalog-scope"><summary>索引范围</summary><p>索引覆盖现有食品审查工作流中的特殊原料、可食用菌种和添加剂。适用范围和用量需按正式依据复核。</p></details>
+        <details id="food-catalog-scope" class="catalog-scope"><summary>索引范围</summary><p>索引覆盖新食品原料、可食用菌种及 GB 2760/GB 14880 添加剂名称。适用范围和用量需按正式法规依据复核。</p></details>
         <div id="catalog-results" aria-live="polite"></div>
       </section>
       <section id="decisions" class="review-body utility" hidden>
@@ -165,6 +178,19 @@
         <button type="submit" value="accepted" class="primary">保存标注</button>
       </div>
     </form>
+  </dialog>
+  <dialog id="projects-dialog" class="projects-dialog">
+    <div class="dialog-heading">
+      <h2>稿件管理</h2>
+      <button id="close-projects" type="button" aria-label="关闭">×</button>
+    </div>
+    <p class="projects-hint">每份导入稿件独立保存于本机浏览器，也可导出为工程备份（.workbench.json）跨设备迁移。</p>
+    <div id="projects-list" class="projects-list"></div>
+    <div class="dialog-actions projects-actions">
+      <button id="export-bundle" type="button">导出当前工程</button>
+      <button id="import-bundle" type="button">导入工程备份</button>
+      <button id="new-project-import" type="button" class="primary">导入新稿件</button>
+    </div>
   </dialog>
 </body>
 </html>

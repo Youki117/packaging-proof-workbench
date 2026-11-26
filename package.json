@@ -1,7 +1,7 @@
 {
   "name": "packaging-proof-workbench",
   "private": true,
-  "version": "0.4.11",
+  "version": "0.5.0",
   "type": "module",
   "engines": {
     "node": ">=24"
