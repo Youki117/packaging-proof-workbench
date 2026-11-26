@@ -1,0 +1,6 @@
+node_modules/
+__pycache__/
+模型配置.json
+patent-register.local.json
+.env
+*.log

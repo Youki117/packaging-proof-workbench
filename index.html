@@ -1,0 +1,170 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>包装审查工作台</title>
+  <link rel="stylesheet" href="/style.css">
+  <script type="module" src="/app.mjs"></script>
+</head>
+<body>
+  <a class="skip" href="#viewer">跳到包装原稿</a>
+  <header class="topbar" title="包装审查工作台 0.4.11">
+    <div class="brand"><h1>包装审查工作台</h1><p id="case-name">正在打开稿件</p></div>
+    <div class="top-actions">
+      <div class="tool-group" role="group" aria-label="打开稿件">
+        <button id="open-files" title="请选择用于回稿的完整展开图或 PDF">导入完整稿</button>
+        <button id="open-formula" type="button" title="关联 XLSX 或配方表图片，对照包装的每克活菌数" disabled>关联配方表</button>
+        <button id="load-sample" hidden>打开样稿</button>
+      </div>
+      <input id="files" type="file" accept=".png,.jpg,.jpeg,.pdf" multiple hidden>
+      <input id="formula-file" type="file" accept=".xlsx,.png,.jpg,.jpeg" hidden>
+      <div class="tool-group" role="group" aria-label="AI 审查">
+        <button id="preflight" disabled>开始 AI 预审</button>
+        <button id="ai-review" hidden>AI 复核本页</button>
+      </div>
+      <div class="tool-group export-tools" role="group" aria-label="导出审查成果">
+        <button id="export-image" class="primary" title="导出完整原图和已确认的修改意见" disabled>导出完整回稿</button>
+        <button id="export" title="导出整稿的修改与待查证意见" disabled>导出修改清单</button>
+      </div>
+    </div>
+  </header>
+  <div class="workbench">
+    <nav class="sheets" aria-label="包装稿件">
+      <div id="sheet-title" class="pane-title"><h2>版面</h2><span id="pages-count"></span></div>
+      <div id="pages" class="page-list"></div>
+      <section id="regions" class="regions" hidden>
+        <h3>原稿定位</h3>
+        <div id="region-links"></div>
+      </section>
+    </nav>
+    <main id="viewer" class="viewer">
+      <div class="viewer-toolbar">
+        <div class="viewer-title"><strong id="page-name"></strong><span id="page-position"></span><span id="active-mark" class="issue-number" hidden></span></div>
+        <div class="viewer-tools">
+          <div class="tool-group" role="group" aria-label="缩放原稿">
+            <button id="zoom-out" class="square" aria-label="缩小" title="缩小">−</button>
+            <button id="fit" title="适合窗口">适合</button>
+            <button id="zoom-in" class="square" aria-label="放大" title="放大">+</button>
+          </div>
+          <div class="tool-group" role="group" aria-label="原稿标注">
+            <button id="add-note" aria-pressed="false">新增标注</button>
+            <button id="redraw" type="button" aria-pressed="false" hidden>重画框</button>
+            <button id="toggle-marks" title="临时隐藏原稿上的所有标框">清屏</button>
+          </div>
+          <button id="crop" aria-pressed="false" title="拖框选择要重新识别的文字">框选识别</button>
+        </div>
+      </div>
+      <div id="stage" class="stage" tabindex="0" aria-label="包装原稿。左键拖动，滚轮缩放。也可使用方向键移动、加减键缩放、按零适合窗口">
+        <div id="canvas" class="proof-canvas" hidden>
+          <img id="proof" alt="" draggable="false">
+          <div id="selection" class="selection" hidden></div>
+        </div>
+        <div id="annotations" class="annotations" role="group" aria-label="原稿标注" hidden></div>
+        <p id="stage-empty" hidden>导入完整展开稿开始审查。支持 PNG、JPG 和 PDF。</p>
+        <div id="notice" class="notice" role="status" hidden></div>
+      </div>
+      <div class="viewer-footer">
+        <span id="page-ocr"></span>
+        <span id="formula-state" role="status"></span>
+        <button id="retry-ocr" hidden>重试识别本页</button>
+        <span id="ai-state" role="status"></span>
+        <span id="processing" role="status" hidden></span>
+        <span id="saved" role="status"></span>
+        <span id="zoom-level">适合窗口</span>
+      </div>
+    </main>
+    <aside class="review" aria-label="审查与查证">
+      <div class="review-nav" role="group" aria-label="审查面板">
+        <button data-panel="findings" aria-pressed="true">疑点 <span id="pending-count">0</span></button>
+        <button data-panel="catalog" aria-pressed="false">名称查证</button>
+        <button data-panel="decisions" aria-pressed="false">修改清单 <span id="kept-count">0</span></button>
+      </div>
+      <section id="findings" class="review-body">
+        <details id="handoff" class="handoff" hidden>
+          <summary id="handoff-summary"></summary>
+          <div class="handoff-body">
+            <div id="handoff-pending"></div>
+            <details id="handoff-all"><summary>查看逐项审查记录</summary><div id="handoff-results"></div></details>
+          </div>
+        </details>
+        <p id="findings-empty" class="empty">正在打开稿件…</p>
+        <div id="details" class="details" hidden>
+          <div class="issue-heading">
+            <h3 id="detail-title"></h3>
+            <span id="detail-status"></span>
+          </div>
+          <div id="issue-evidence" class="issue-evidence" aria-label="疑点证据" tabindex="0">
+            <blockquote id="detail-quote" hidden></blockquote>
+            <details id="ocr-versions" hidden>
+              <summary>对照整页识别文字</summary>
+              <blockquote id="ocr-baseline"></blockquote>
+            </details>
+          </div>
+          <div class="evidence-actions">
+            <button id="find-names" class="name-action" hidden>查这段配料</button>
+            <p id="detail-location" hidden>确认修改前，请先在原稿上「补画框」。</p>
+          </div>
+          <div class="issue-decision">
+            <label for="note">审查意见</label>
+            <textarea id="note" rows="3" maxlength="2000" placeholder="填写修改或查证意见"></textarea>
+            <div id="decision-buttons" class="decision-buttons">
+              <button data-status="accepted" class="primary" title="确认这处需要修改（Ctrl 或 ⌘ + Enter）" aria-keyshortcuts="Control+Enter Meta+Enter">确认需修改</button>
+              <button data-status="followup">待查证</button>
+              <button data-status="dismissed">排除此疑点</button>
+              <button data-status="pending" hidden>恢复待核对</button>
+            </div>
+          </div>
+        </div>
+        <div class="list-filter">
+          <select id="filter" aria-label="筛选疑点">
+            <option value="all">全部记录</option>
+            <option value="pending">待核对</option>
+            <option value="copy">文字 / 单位</option>
+            <option value="names">配料名称</option>
+            <option value="claims">宣传用语</option>
+            <option value="dismissed">已排除</option>
+          </select>
+          <div class="finding-nav" role="group" aria-label="在当前筛选结果中定位疑点">
+            <button id="previous-issue" disabled>上一条</button>
+            <span id="finding-position" role="status"></span>
+            <button id="next-issue" disabled>下一条</button>
+          </div>
+        </div>
+      </section>
+      <section id="catalog" class="review-body utility" hidden>
+        <button id="catalog-back" class="catalog-back" hidden>返回配料疑点</button>
+        <form id="catalog-form">
+          <label id="catalog-label" for="catalog-input">普通食品配料名称</label>
+          <select id="catalog-section" aria-label="查证目录" hidden>
+            <option value="raw">饲料原料目录</option>
+            <option value="additive">饲料添加剂品种目录</option>
+          </select>
+          <textarea id="catalog-input" rows="4" maxlength="2000" required placeholder="例如：菊粉、赤藓糖醇" aria-describedby="catalog-hint"></textarea>
+          <p id="catalog-hint">多个名称用顿号、逗号或换行分隔。</p>
+          <button id="catalog-search" type="submit" class="primary">查名称</button>
+        </form>
+        <details id="food-catalog-scope" class="catalog-scope"><summary>索引范围</summary><p>索引覆盖现有食品审查工作流中的特殊原料、可食用菌种和添加剂。适用范围和用量需按正式依据复核。</p></details>
+        <div id="catalog-results" aria-live="polite"></div>
+      </section>
+      <section id="decisions" class="review-body utility" hidden>
+        <div id="decisions-list"></div>
+      </section>
+    </aside>
+  </div>
+  <dialog id="note-dialog">
+    <form id="note-form">
+      <div class="dialog-heading"><h2>新增标注</h2><button id="cancel-note" type="button" aria-label="关闭">×</button></div>
+      <div class="dialog-location"><p id="note-location"></p><button id="position-note" type="button">重新框选</button></div>
+      <label for="manual-note">审查意见</label>
+      <textarea id="manual-note" rows="3" maxlength="2000" autofocus></textarea>
+      <label for="manual-quote">原文 <small>可选</small></label>
+      <input id="manual-quote" maxlength="300" placeholder="原稿上的文字">
+      <div class="dialog-actions">
+        <button type="submit" value="followup">存为待查证</button>
+        <button type="submit" value="accepted" class="primary">保存标注</button>
+      </div>
+    </form>
+  </dialog>
+</body>
+</html>

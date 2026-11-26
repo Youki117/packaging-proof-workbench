@@ -1,0 +1,17 @@
+{
+  "name": "packaging-proof-workbench",
+  "private": true,
+  "version": "0.4.11",
+  "type": "module",
+  "engines": {
+    "node": ">=24"
+  },
+  "scripts": {
+    "start": "node server.mjs",
+    "test": "node --test"
+  },
+  "dependencies": {
+    "jszip": "3.10.1",
+    "xml-js": "1.6.11"
+  }
+}
