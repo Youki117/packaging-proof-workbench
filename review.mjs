@@ -1,3 +1,5 @@
+import { detectProofCategory, matchClaimRule, matchJoinedStatements } from './rules.mjs';
+
 export const statuses = { pending: '待核对', accepted: '需修改', dismissed: '已排除', followup: '待查证' };
 export const categories = { copy: '文字 / 单位', claims: '宣传用语', names: '配料名称', manual: '人工批注' };
 
@@ -9,7 +11,6 @@ const screenshotRegions = [
   ['sample-3', '内袋', [105, 542, 191, 324]]
 ];
 
-// Register the old screenshot to the 6252 × 5522 original using matching artwork in all three regions.
 function originalBox([x, y, width, height]) {
   const scale = 4.431;
   return [(258 + x * scale) / 6252, (1185 + y * scale) / 5522,
@@ -57,11 +58,15 @@ export function bounds(lines) {
 }
 
 const compactText = text => text.normalize('NFC').replace(/\s+/gu, '');
-const cfuClaimScope = /(\d+(?:\.\d+)?)亿CFU\/(盒|袋|条|g|克)(?![a-z])/iu;
+const cfuClaimScope = /(\d+(?:\.\d+)?)亿(?:CFU|活(?:性)?菌)?\/(盒|袋|条|支|瓶|g|克)(?![a-z])/iu;
 
 export function isPetProof(lines) {
-  return lines.some(({ text }) => /宠物益生菌|宠物营养补充剂|宠物添加剂预混合饲料|补充性宠物食品|宠物饲料卫生规定/.test(compactText(text)))
-    || ['原料组成', '添加剂组成'].every(label => lines.some(({ text }) => compactText(text).startsWith(`【${label}】`)));
+  return detectProofCategory(lines) === 'pet';
+}
+
+export function resolveProofCategory(lines, override = 'auto') {
+  if (override === 'pet' || override === 'food') return override;
+  return detectProofCategory(lines);
 }
 
 function wordBox(line, start, end) {
@@ -224,10 +229,11 @@ function ingredientBlock(lines, first, firstText) {
   };
 }
 
-export function inspectLines(lines, pageId) {
+export function inspectLines(lines, pageId, options = {}) {
   const findings = [];
   const readableLines = lines.map((line, index) => ({ ...line, text: compareText(line.text), index }));
-  const pet = isPetProof(lines);
+  const category = resolveProofCategory(lines, options.category);
+  const pet = category === 'pet';
   readableLines.forEach((line, index) => {
     const { text: readable, box } = line;
     const compact = readable.replace(/\s+/g, '');
@@ -261,31 +267,31 @@ export function inspectLines(lines, pageId) {
         });
       }
     }
-    const petClaim = pet && /(?:用于)?(?:调理|缓解|改善|预防|治疗)[^；。！？]{0,24}(?:软便|腹泻|肠道紊乱)|降低药物带来的肠胃刺激/.exec(compact);
     const countClaim = /\d+(?:\.\d+)?亿\s*(?:CFU|活(?:性)?菌)(?:添加)?/i.exec(compact);
-    const claim = /治疗|治愈|根治|疗效|降血糖|降血压|增强免疫力|调节肠道菌群|(?:中国发明)?专利菌株|\d+株专利菌/.exec(compact);
-    if (petClaim) {
-      precise('claims', '复核宠物功效表述', '这段涉及动物症状或用药效果。请结合原稿和支持材料复核宣传表述。', petClaim[0]);
+    const claimHit = matchClaimRule(compact, category);
+    if (claimHit && (claimHit.title !== '核对宣传表述与依据' || !countClaim)) {
+      precise('claims', claimHit.title, claimHit.reason, claimHit.quote);
     } else if (countClaim) {
       const scope = cfuClaimScope.exec(compact.normalize('NFKC'));
       const reason = scope ? `包装识别为每${scope[2].toLowerCase() === 'g' ? '克' : scope[2]}，请与配方及背标明细核对数值。`
         : '请确认每克、每袋或整盒的标示口径，并核对与配方及包装明细是否一致。';
       precise('claims', '核对活菌数声称', reason, scope?.[0] ?? countClaim[0]);
-    } else if (claim) {
-      precise('claims', '核对宣传表述与依据', '请结合整面包装、产品类别和支持材料，判断这处表达是否需要修改。', claim[0]);
+    } else if (claimHit) {
+      precise('claims', claimHit.title, claimHit.reason, claimHit.quote);
     }
+
     const unit = /\d+(?:\.\d+)?(?:KG|Kg|MG|Mg|ML|Ml|G)(?![a-zA-Z])/.exec(compact);
     const punctuation = /[，、；：]{2,}/.exec(compact);
+    const joined = matchJoinedStatements(compact, category);
     if (/净含量|净重|规格/.test(compact) && unit) {
       precise('copy', '核对单位写法', '识别结果出现了大写或混写单位。请先核对原稿中的字符和单位。', unit[0]);
     } else if (punctuation) {
       precise('copy', '核对重复标点', '识别结果中出现相连标点，请对照原稿确认。', punctuation[0]);
+    } else if (joined) {
+      precise('copy', joined.title, joined.reason, joined.quote);
     } else if (pet) {
       const separator = /CFU\/g[)）](?:[\p{Script=Han}]{2,12}(?:杆菌|球菌|酵母))/iu.exec(compact);
       if (separator) precise('copy', '核对成分间分隔符', '两项成分之间疑似缺少分隔符，请对照原稿。', separator[0]);
-      const joinedNotices = '反刍动物产品质量检验';
-      if (compact.includes(joinedNotices)) precise('copy', '核对两项标示之间的分隔',
-        '识别到反刍动物警示和质量检验标示连在一起。请对照原稿，在「反刍动物」后换行，或加句号分开。', joinedNotices);
     }
   });
   return findings;
@@ -294,54 +300,64 @@ export function inspectLines(lines, pageId) {
 const cfuName = text => compactText(text).normalize('NFKC').toLowerCase();
 const billion = n => `${Number((n / 1e8).toPrecision(12))} 亿 CFU/g`;
 
+function parseNetWeights(entry) {
+  const net = /^净含量[:：]?(?:(\d+(?:\.\d+)?)g(?:\((\d+(?:\.\d+)?)g(?:\/(?:袋|条|支|包))?[x×*](\d+)(?:袋|条|支|包)?\))?|(\d+(?:\.\d+)?)g(?:\/(?:袋|条|支|包))?[x×*](\d+)(?:袋|条|支|包)?)$/iu.exec(entry);
+  if (!net) return null;
+  const [, total, weight, count, packWeight, packs] = net;
+  if (weight && Math.abs(Number(weight) * Number(count) - Number(total)) > 1e-6) return null;
+  const totalGrams = total ? Number(total) : Number(packWeight) * Number(packs);
+  const packGrams = weight ? Number(weight) : packWeight ? Number(packWeight) : null;
+  return totalGrams > 0 ? { totalGrams, packGrams } : null;
+}
+
 function compareCfuClaims(lines, pageId, rows, formula, complete) {
   const display = lines.map(line => line.text.normalize('NFKC').replace(/\s+/gu, ''));
-  const netGrams = entry => {
-    const net = /^净含量[:：]?(?:(\d+(?:\.\d+)?)g(?:\((\d+(?:\.\d+)?)g[x×*](\d+)(?:袋|条)?\))?|(\d+(?:\.\d+)?)g[x×*](\d+)(?:袋|条)?)$/iu.exec(entry);
-    if (!net) return;
-    const [, total, weight, count, packWeight, packs] = net;
-    if (weight && Math.abs(Number(weight) * Number(count) - Number(total)) > 1e-6) return;
-    return total ? Number(total) : Number(packWeight) * Number(packs);
-  };
-  const proofWeights = new Set(display.map(netGrams).filter(grams => grams > 0));
+  const parsedWeights = display.map(parseNetWeights);
+  const proofTotalWeights = new Set(parsedWeights.filter(Boolean).map(item => item.totalGrams));
+  const proofPackWeights = new Set(parsedWeights.filter(item => item?.packGrams > 0).map(item => item.packGrams));
   const ready = complete && rows.length > 0 && rows.every(row => row.state !== 'pending' && Number.isFinite(row.value));
   const perGram = rows.reduce((sum, row) => sum + row.value, 0);
   const claims = [];
   for (const [index, text] of display.entries()) {
     const explicit = cfuClaimScope.exec(text);
-    if (explicit && ['袋', '条'].includes(explicit[2])) continue;
-    const claim = explicit ?? /^(\d+(?:\.\d+)?)亿活性菌添加$/u.exec(text);
+    const claim = explicit ?? /^(\d+(?:\.\d+)?)亿活(?:性)?菌(?:添加)?$/u.exec(text);
     if (!claim) continue;
     const line = lines[index];
     const box = matchQuote([line], claim[0])?.boxes[0] ?? line.box;
     const key = { pageId, box, quote: claim[0], title: claim[0] };
-    const boxScope = !explicit || explicit[2] === '盒';
+    const unitKind = explicit ? explicit[2].toLowerCase() : 'box_implicit';
+    const isPerPack = ['袋', '条', '支'].includes(unitKind);
+    const isPerBox = unitKind === '盒' || unitKind === 'box_implicit' || unitKind === '瓶';
     let grams = 1;
-    if (!explicit) {
+    if (unitKind === 'box_implicit') {
       const [x, y, w, h] = readingBox(line);
-      const nearbyWeights = new Set(display.flatMap((entry, ordinal) => {
-        if (lines[ordinal].rotation !== line.rotation) return [];
+      const nearbyWeights = new Set(parsedWeights.flatMap((entry, ordinal) => {
+        if (!entry || lines[ordinal].rotation !== line.rotation) return [];
         const [left, top, width, height] = readingBox(lines[ordinal]);
         if (Math.abs(top + height / 2 - y - h / 2) > h * 2
             || Math.abs(left + width / 2 - x - w / 2) > .3) return [];
-        const weight = netGrams(entry);
-        return weight > 0 ? [weight] : [];
+        return [entry.totalGrams];
       }));
       if (!ready || nearbyWeights.size !== 1) continue;
       [grams] = nearbyWeights;
-    } else if (boxScope) {
-      [grams] = proofWeights.size === 1 ? proofWeights : [];
+    } else if (isPerBox) {
+      [grams] = proofTotalWeights.size === 1 ? proofTotalWeights : [];
+    } else if (isPerPack) {
+      [grams] = proofPackWeights.size === 1 ? proofPackWeights : [];
     }
     if (!ready || !grams) {
+      const scopeName = isPerPack ? `每${unitKind}` : isPerBox ? '整盒' : '每克';
       claims.push({ ...key, state: 'pending', reason: !ready ? '原稿已标明计量口径，先补齐背标逐菌活菌数，再核算这处声称。'
-        : '原稿已写每盒，尚未读取到唯一的净含量。请核对整盒克重后再比较数值。' });
+        : `原稿已写${scopeName}，尚未读取到唯一的对应净含量规格。请核对克重后再比较数值。` });
       continue;
     }
     const total = perGram * grams / 1e8;
     const declared = Number(claim[1]);
     const formulaTotal = formula.rows.reduce((sum, row) => sum + row.perGram, 0) * grams / 1e8;
     const matches = value => Math.abs(value - declared) <= Math.max(1, declared, value) * 1e-9;
-    const printed = `背标 ${rows.length} 项合计 ${billion(perGram)}${boxScope ? `，按${explicit ? '' : '同面'}净含量 ${grams} g 折算为整盒 ${Number(total.toPrecision(12))} 亿 CFU` : ''}`;
+    const scopeLabel = isPerPack ? `每${unitKind}` : isPerBox ? '整盒' : '每克';
+    const printed = `背标 ${rows.length} 项合计 ${billion(perGram)}${isPerBox || isPerPack
+      ? `，按${explicit ? '' : '同面'}净含量 ${grams} g 折算为${scopeLabel} ${Number(total.toPrecision(12))} 亿 CFU` : ''}`;
     if (matches(total) && matches(formulaTotal)) {
       if (explicit) claims.push({ ...key, state: 'checked', reason: `${printed}。与配方和包装声称一致。` });
       continue;
@@ -349,22 +365,26 @@ function compareCfuClaims(lines, pageId, rows, formula, complete) {
     const advice = matches(formulaTotal) ? '按配方可达到正面数值，请先修正背标与配方不符的项目。'
       : '请按配方核对并统一声称及背标数值。';
     const reason = `${printed}，声称为 ${declared} 亿。${advice}${explicit ? '' : '请写清「每盒」口径。'}`;
-    const id = `${pageId}-formula-${boxScope ? 'box' : 'gram'}-${index}`;
+    const id = `${pageId}-formula-${isPerPack ? 'pack' : isPerBox ? 'box' : 'gram'}-${index}`;
+    const title = isPerPack ? `核对每${unitKind}活菌数与背标合计`
+      : isPerBox ? '核对整盒活菌数与背标合计' : '核对每克活菌数与背标合计';
     claims.push({ ...key, state: 'difference', reason, issue: { ...key, id, boxes: [box], type: 'claims',
-      source: 'formula', title: boxScope ? '核对整盒活菌数与背标合计' : '核对每克活菌数与背标合计', status: 'pending', note: '', reason } });
+      source: 'formula', title, status: 'pending', note: '', reason } });
   }
   return claims;
 }
 
 export function compareFormulaCfu(lines, pageId, formula, localBlocks = [], previous = []) {
+  const cfuRows = formula?.rows ?? [];
+  if (!cfuRows.length) return { findings: [], matched: [], rows: [], claims: [] };
   const counts = new Map();
-  const blocks = inspectLines(lines, pageId).filter(finding => finding.title === '核对添加剂组成')
+  const blocks = inspectLines(lines, pageId).filter(finding => finding.title === '核对添加剂组成' || finding.title === '核对配料名称')
     .map(finding => finding.lineIndexes.map(index => lines[index]));
   for (const block of [...blocks, ...localBlocks]) {
     for (const alternate of [false, true]) {
       const text = block.map((line, i) => {
         const content = compactText(alternate ? line.alternate ?? line.text : line.text);
-        return i === 0 && content === '添加剂组成' ? '' : content;
+        return i === 0 && /^(?:添加剂组成|配料表?)$/.test(content) ? '' : content;
       });
       const joined = text.join('');
       for (const match of joined.matchAll(/([\p{Script=Han}]{2,24}(?:[a-z][a-z\d-]*?\d[a-z\d-]*?)?)([(（]?)(\d+(?:\.\d+)?)[×x*]10(?:\^?(\d{1,2})|([⁰¹²³⁴⁵⁶⁷⁸⁹]{1,2})|[°º]?)(?:CFU\/g)([)）]?)/giu)) {
@@ -392,11 +412,11 @@ export function compareFormulaCfu(lines, pageId, formula, localBlocks = [], prev
     }
   }
   const names = new Map();
-  for (const row of formula.rows) {
+  for (const row of cfuRows) {
     const key = cfuName(row.name);
     names.set(key, (names.get(key) ?? 0) + 1);
   }
-  const rows = formula.rows.map((row, index) => {
+  const rows = cfuRows.map((row, index) => {
     const key = cfuName(row.name);
     const amounts = counts.get(key);
     const valid = [...(amounts ?? [])].filter(([value]) => value !== null);
@@ -406,7 +426,7 @@ export function compareFormulaCfu(lines, pageId, formula, localBlocks = [], prev
     const fingerprint = JSON.stringify([row, names.get(key), [...(amounts ?? [])], candidates.map(([name, values]) => [name, [...values]])]);
     if (previous[index]?.fingerprint === fingerprint) return previous[index];
     const entry = { index, key, pageId, title: row.name, cell: row.cell, expected: Number.isFinite(row.perGram) ? billion(row.perGram) : '',
-      state: 'pending', reason: '在包装添加剂栏未找到对应名称或菌株号。', fingerprint };
+      state: 'pending', reason: '在包装配料/添加剂栏未找到对应名称或菌株号。', fingerprint };
     if (!Number.isFinite(row.perGram)) return { ...entry, box: valid[0]?.[1].box ?? amounts?.get(null)?.box,
       reason: '配方表的每克活菌数缺失或无法解析，请核对单元格。' };
     if (names.get(key) !== 1) return { ...entry, reason: '配方表有重复名称，需核对菌株编号和对应行。' };
@@ -430,9 +450,34 @@ export function compareFormulaCfu(lines, pageId, formula, localBlocks = [], prev
       reason: `包装识别为 ${billion(perGram)}，配方表「${formula.name}」${row.cell}${row.image ? '的每克列' : ''} 为 ${billion(row.perGram)}。请对照两份原稿确认。` };
     return { ...result, state: 'difference', issue };
   });
-  const claims = compareCfuClaims(lines, pageId, rows, formula, counts.size === rows.length);
+  const claims = compareCfuClaims(lines, pageId, rows, { ...formula, rows: cfuRows }, counts.size === rows.length);
   return { findings: [...rows, ...claims].flatMap(row => row.issue ? [row.issue] : []),
     matched: rows.filter(row => row.state !== 'pending').map(row => row.key), rows, claims };
+}
+
+export function compareFormulaIngredients(lines, pageId, formula, localQueries = []) {
+  const list = formula?.ingredients ?? [];
+  if (!list.length) return [];
+  const sections = inspectLines(lines, pageId).filter(item => item.type === 'names' && item.query);
+  const poolText = [
+    ...sections.map(item => item.query),
+    ...localQueries
+  ].join('、');
+  const normalizedPool = cfuName(poolText).replace(/[（()）]/g, '');
+  const anchorBox = sections[0]?.box;
+  return list.map(row => {
+    const key = cfuName(row.name).replace(/[（()）]/g, '');
+    const found = key.length >= 2 && normalizedPool.includes(key);
+    return {
+      title: row.name,
+      cell: row.cell,
+      expected: row.amount || '',
+      pageId,
+      box: anchorBox,
+      state: found ? 'checked' : 'pending',
+      reason: found ? '包装配料/成分栏已识别到该配方成分。' : '未在包装配料/成分栏直接匹配到该配方成分，请对照原稿确认是否存在漏标或别名写法。'
+    };
+  });
 }
 
 export const annotationBoxes = issue => issue.boxes ?? (issue.type === 'manual' && issue.box ? [issue.box] : []);

@@ -15,11 +15,11 @@ export function formulaCfuRows(text) {
       return match ? [{ column: match[1], row: Number(match[2]), value: match[3].replace(/\s+/g, '') }] : [];
     });
     const heading = cells.findIndex((cell, index) => index > 0
-      && /^(?:(?:每克)?活菌数[（(]?)?(?:\d+(?:\.\d+)?)?(?:[亿万](?:CFU)?|CFU)\/(?:g|克)[)）]?$/i.test(cell.value)
+      && /^(?:(?:每(?:克|千克))?活菌数[（(]?)?(?:\d+(?:\.\d+)?)?(?:[亿万](?:CFU)?|CFU)\/(?:kg|g|千克|克)[)）]?$/i.test(cell.value)
       && /名称|菌种|微生物|标准|企标/.test(cells[index - 1].value));
     if (heading >= 0) {
       const [name, count] = cells.slice(heading - 1, heading + 1);
-      const unit = /(?:[亿万](?:CFU)?|CFU)\/(?:g|克)/i.exec(count.value)[0];
+      const unit = /(?:[亿万](?:CFU)?|CFU)\/(?:kg|g|千克|克)/i.exec(count.value)[0];
       columns = { name: name.column, count: count.column, row: count.row, unit };
       continue;
     }
@@ -34,7 +34,56 @@ export function formulaCfuRows(text) {
     const perGram = count?.value ? cfu(count.value, columns.unit) : null;
     rows.push({ name: name.value, perGram, cell: `${sheet}!${columns.count}${name.row}` });
   }
-  if (!rows.length) throw Error('配方表未找到带明确 CFU/g 或亿/g 单位的菌种明细。请核对工作表中的菌种和每克活菌数列。');
+  if (!rows.length) throw Error('配方表未找到带明确 CFU/g、CFU/kg 或亿/g 单位的菌种明细。请核对工作表中的菌种和活菌数列。');
+  return rows;
+}
+
+export function formulaIngredientRows(text) {
+  const rows = [];
+  const seen = new Set();
+  let columns;
+  let sheet = 'Sheet1';
+  for (const line of text.split('\n')) {
+    if (line.startsWith('Sheet: ')) {
+      sheet = line.slice(7);
+      columns = undefined;
+      continue;
+    }
+    const cells = line.split('\t').flatMap(value => {
+      const match = /^([A-Z]+)(\d+)=(.*)$/u.exec(value);
+      return match ? [{ column: match[1], row: Number(match[2]), value: match[3].trim() }] : [];
+    });
+    const nameHeading = cells.find(cell =>
+      /^(?:原辅?料|配料|原料|添加剂|成分|物料)(?:名称)?$|^品名$/u.test(cell.value.replace(/\s+/g, '')));
+    if (nameHeading) {
+      const amountHeading = cells.find(cell => cell !== nameHeading
+        && /(?:占比|比例|配比|添加量|用量|含量|%|％|g\/|mg\/)/iu.test(cell.value));
+      columns = { name: nameHeading.column, amount: amountHeading?.column, row: nameHeading.row };
+      continue;
+    }
+    if (!columns) continue;
+    const nameCell = cells.find(cell => cell.column === columns.name);
+    if (!nameCell || nameCell.row !== columns.row + 1) {
+      columns = undefined;
+      continue;
+    }
+    const cleaned = nameCell.value.replace(/\s+/g, '');
+    if (!cleaned || cleaned.length > 40 || /^(?:合计|总计|小计|备注|说明|企标|序号|\d+(?:\.\d+)?%?)$/u.test(cleaned)) {
+      columns = undefined;
+      continue;
+    }
+    columns.row = nameCell.row;
+    const amountCell = columns.amount ? cells.find(cell => cell.column === columns.amount) : undefined;
+    const key = cleaned.normalize('NFKC').toLowerCase();
+    if (!seen.has(key)) {
+      seen.add(key);
+      rows.push({
+        name: cleaned,
+        amount: amountCell?.value ?? '',
+        cell: `${sheet}!${columns.name}${nameCell.row}`
+      });
+    }
+  }
   return rows;
 }
 
@@ -48,12 +97,11 @@ export function formulaImageCfuRows(lines) {
     && cell.right <= heading.right + heading.width * .65;
   const sameAmount = (a, b) => Number.isFinite(a) && Number.isFinite(b)
     && Math.abs(a - b) <= Math.max(Math.abs(a), Math.abs(b)) * 1e-9;
-  // shortcut: align explicit count and total headings in clear table screenshots, add a layout parser for other table forms.
   for (const heading of headings) {
     const marker = cells.find(cell => cell.right < heading.x && sameRow(cell, heading)
       && /^(?:企标[\w-]+|(?:菌种|微生物)(?:名称|明细)?|活菌(?:数|明细))$/u.test(cell.text));
     if (!marker) continue;
-    const bag = cells.find(cell => cell.x > heading.x && sameRow(cell, heading) && /^\d+(?:\.\d+)?[亿万](?:CFU)?\/袋$/iu.test(cell.text));
+    const bag = cells.find(cell => cell.x > heading.x && sameRow(cell, heading) && /^\d+(?:\.\d+)?[亿万](?:CFU)?\/(?:袋|条|支)$/iu.test(cell.text));
     const unit = /[亿万](?:CFU)?\/(?:g|克)/i.exec(heading.text)[0];
     const writtenTotal = cfu(heading.text.slice(0, -unit.length), unit);
     const bagUnit = bag ? /[亿万]/u.exec(bag.text)[0] + '/g' : '';

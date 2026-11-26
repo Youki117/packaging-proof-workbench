@@ -1,9 +1,43 @@
-import { bounds, ingredientNames, inspectLines, isPetProof, matchQuote, rotateBox } from './review.mjs';
+import { bounds, ingredientNames, inspectLines, isPetProof, matchQuote, readingBox, resolveProofCategory, rotateBox } from './review.mjs';
+import { FOOD_LABEL_FIELDS, PET_EXTENDED_FIELDS, PET_PRODUCTION_FIELDS } from './rules.mjs';
 
 const compact = text => text.normalize('NFKC').replace(/\s+/gu, '');
 const missingExponent = /\d+(?:\.\d+)?[x×*]10[°º]?CFU\/g/giu;
 const explicitExponent = /^(\d+(?:\.\d+)?)[x×*]10\^?(\d{1,2})CFU\/g$/iu;
-const weight = /^(?:(?:[<>≤≥])?\d+(?:\.\d+)?|\d+(?:\.\d+)?[-~～–]\d+(?:\.\d+)?)kg$/iu;
+const weightUnit = '(?:kg|公斤|g|克)';
+const weight = new RegExp(`^(?:(?:[<>≤≥])?\\d+(?:\\.\\d+)?|\\d+(?:\\.\\d+)?[-~～–]\\d+(?:\\.\\d+)?)${weightUnit}$`, 'iu');
+const bareBoundaryWeight = new RegExp(`^(\\d+(?:\\.\\d+)?)(${weightUnit})$`, 'iu');
+const rangeWeight = new RegExp(`^(\\d+(?:\\.\\d+)?)[-~～–](\\d+(?:\\.\\d+)?)(${weightUnit})$`, 'iu');
+
+function levenshtein(a, b) {
+  const m = a.length;
+  const n = b.length;
+  const dp = Array.from({ length: n + 1 }, (_, j) => j);
+  for (let i = 1; i <= m; i += 1) {
+    let prev = dp[0];
+    dp[0] = i;
+    for (let j = 1; j <= n; j += 1) {
+      const temp = dp[j];
+      dp[j] = a[i - 1] === b[j - 1] ? prev : 1 + Math.min(prev, dp[j], dp[j - 1]);
+      prev = temp;
+    }
+  }
+  return dp[n];
+}
+
+function similarButDifferentName(front, back) {
+  if (front === back) return false;
+  if ([...front].sort().join('') === [...back].sort().join('')) return true;
+  if (Math.abs(front.length - back.length) > 1 || Math.min(front.length, back.length) < 3) return false;
+  // Avoid matching generic suffixes like "宠物益生菌" vs "益生菌"
+  if (front.includes(back) || back.includes(front)) return false;
+  const dist = levenshtein(front, back);
+  const maxDist = front.length >= 5 ? 2 : 1;
+  if (dist > maxDist) return false;
+  const setA = new Set(front);
+  const shared = [...new Set(back)].filter(ch => setA.has(ch)).length;
+  return shared / Math.max(setA.size, new Set(back).size) >= 0.5;
+}
 
 export function proofNameCandidates(lines) {
   const front = new Map();
@@ -11,14 +45,15 @@ export function proofNameCandidates(lines) {
   for (const line of lines) {
     const text = compact(line.text);
     if (/^\p{Script=Han}{3,12}$/u.test(text)) front.set(text, line);
-    const name = /^(?:【产品名称】|\[产品名称\]|产品名称:)[:：]?(?:宠物营养补充剂|补充性宠物食品|宠物添加剂预混合饲料)[:：]?(\p{Script=Han}{3,12})$/u.exec(text)?.[1];
+    const petName = /^(?:【产品名称】|\[产品名称\]|产品名称:)[:：]?(?:宠物营养补充剂|补充性宠物食品|宠物添加剂预混合饲料)[:：]?(\p{Script=Han}{3,12})$/u.exec(text)?.[1];
+    const foodName = !petName && /^(?:【(?:产品名称|品名)】|\[(?:产品名称|品名)\]|(?:产品名称|品名):)[:：]?(\p{Script=Han}{3,12})$/u.exec(text)?.[1];
+    const name = petName || foodName;
     if (name) back.push({ name, line });
   }
   for (const { name, line } of back) {
     if (front.has(name)) continue;
-    const letters = [...name].sort().join('');
     for (const [other, frontLine] of front) {
-      if ([...other].sort().join('') !== letters) continue;
+      if (!similarButDifferentName(other, name)) continue;
       const boxes = matchQuote([line], name)?.boxes;
       if (boxes?.length !== 1) continue;
       return [{ quote: other, box: frontLine.box, rotation: frontLine.rotation },
@@ -68,7 +103,7 @@ export function formulaCoversModelIssue(issue, formulaIssues) {
 }
 
 export function catalogGlyphSupersedes(finding, glyphQuote) {
-  if (!/下标|字形|希腊|拉丁|字母/.test(finding.reason)) return false;
+  if (!/下标|上标|字形|希腊|拉丁|字母/.test(finding.reason)) return false;
   const original = compact(finding.quote);
   const cited = compact(glyphQuote);
   return original.length >= 2 && cited.length >= 2 && (original.includes(cited) || cited.includes(original));
@@ -77,7 +112,7 @@ export function catalogGlyphSupersedes(finding, glyphQuote) {
 const petSections = ['核对原料组成', '核对添加剂组成'];
 
 export function reviewSections(lines, pet = false) {
-  const found = inspectLines(lines, 'sections').filter(issue => issue.lineIndexes);
+  const found = inspectLines(lines, 'sections', { category: pet ? 'pet' : 'food' }).filter(issue => issue.lineIndexes);
   const anchors = found.filter(({ title }) => petSections.includes(title));
   if (pet && anchors.length === 1) {
     const [anchor] = anchors;
@@ -100,14 +135,13 @@ export function reviewSections(lines, pet = false) {
 }
 
 export function petCatalogText(text) {
-  // The bracketed quantity is not part of the catalog name. A second numbered strain is a separate lookup.
   return text.replace(/[(（]\s*\d+(?:\.\d+)?\s*[x×*]\s*10[\d^⁰¹²³⁴⁵⁶⁷⁸⁹°º]*\s*CFU\s*\/\s*g\s*[)）](?=([\p{Script=Han}]+[A-Z][\w-]+\s*[(（]\s*\d)?)/giu,
     (_, next) => next ? '、' : '').replace(/\d+(?:\.\d+)?\s*[x×*]\s*10[\d^⁰¹²³⁴⁵⁶⁷⁸⁹°º]*\s*CFU\s*\/\s*g/giu, '');
 }
 
 export function sectionReread(section, primary, corroborating) {
-  const relevant = lines => reviewSections(lines).filter(item => item.title === section.title && item.query
-    && intersectsBox(item.box, section.box));
+  const relevant = lines => reviewSections(lines, petSections.includes(section.title))
+    .filter(item => item.title === section.title && item.query && intersectsBox(item.box, section.box));
   const [candidate, extra] = relevant(primary);
   if (!candidate || extra) return;
   const names = query => ingredientNames(section.title === petSections[1] ? petCatalogText(query) : query)
@@ -133,21 +167,49 @@ function sectionQuote(block, quote) {
   return found.length === 1 ? found[0] : undefined;
 }
 
+const GREEK_LOOKALIKES = [
+  ['β', /[bB]/],
+  ['γ', /[rRyY]/],
+  ['μ', /[uU]/],
+  ['ω', /[wW]/]
+];
+
+function detectGlyphVerification(query, name, block) {
+  const expectedSub = /([A-Za-z])([₀-₉]+)/.exec(name);
+  if (expectedSub) {
+    const base = expectedSub[1];
+    const tokenPattern = new RegExp(`${base}[\\d₀-₉]*\\d[\\d₀-₉]*`);
+    const observed = tokenPattern.exec(query)?.[0];
+    if (observed && observed.normalize('NFKC') === expectedSub[0].normalize('NFKC')) {
+      const glyphBox = block.map(line => matchQuote([line], observed)?.boxes?.[0]).find(Boolean);
+      return { glyph: 'subscript', glyphBase: base, glyphBox };
+    }
+  }
+  if (/[aA]/.test(query) && /α/.test(name)) {
+    return { glyph: 'alpha' };
+  }
+  for (const [greek, latinRe] of GREEK_LOOKALIKES) {
+    if (name.includes(greek) && !query.includes(greek) && latinRe.test(query)) {
+      const observed = latinRe.exec(query)[0];
+      return { glyph: 'greek', glyphExpected: greek, glyphObserved: observed };
+    }
+  }
+  return {};
+}
+
 export function catalogFormatFindings(pageId, lines, section, items) {
   const block = section.lineIndexes.map(index => lines[index]);
-  return items.flatMap(({ query, status, verdict, name, record }) => {
-    if (status !== 'format_deviation' || verdict !== 'nonconforming' || !record || !name || !query) return [];
+  const actionableStatuses = new Set(['format_deviation', 'normalized', 'duplicated_char', 'alias_only']);
+  return items.flatMap(({ query, status, verdict, name, record, notes }) => {
+    if (!actionableStatuses.has(status) || verdict !== 'nonconforming' || !record || !name || !query) return [];
     const position = sectionQuote(block, query);
     if (!position?.boxes.length) return [];
-    const vitamin = /B[\d₀-₉]*\d[\d₀-₉]*/.exec(query)?.[0];
-    const expected = /B[₀-₉]+/.exec(name)?.[0];
-    const glyph = vitamin && expected && vitamin.normalize('NFKC') === expected.normalize('NFKC') ? 'subscript'
-      : /[aA]/.test(query) && /α/.test(name) ? 'alpha' : undefined;
-    const glyphBox = glyph === 'subscript' ? block.map(line => matchQuote([line], vitamin)?.boxes?.[0]).find(Boolean) : undefined;
+    const glyphMeta = status === 'format_deviation' ? detectGlyphVerification(query, name, block) : {};
+    const detail = notes?.length ? `${notes.join(' ')} ` : '';
     return [{ id: `${pageId}-catalog-${section.id}-${record}-${query}`, pageId, type: 'names', source: 'catalog',
-      glyph, glyphBox, catalogSection: section.title === petSections[1] ? 'additive' : 'raw',
+      ...glyphMeta, catalogSection: section.title === petSections[1] ? 'additive' : 'raw',
       title: '核对目录名称写法', quote: query, ...position, status: 'pending', note: '',
-      reason: `本地目录条目 ${record} 的对应写法为「${name}」。请对照原图核实该项名称、字形和排版。` }];
+      reason: `本地目录条目 ${record} 的对应写法为「${name}」。${detail}请对照原图核实该项名称、字形和排版。` }];
   });
 }
 
@@ -155,7 +217,7 @@ export function catalogReviewRows(block, section, items, glyphs, flagged) {
   return items.map(item => {
     const { query, verdict, record, name, catalog, source } = item;
     const glyph = glyphs.find(entry => entry.quote === query);
-    const visualMatch = ['subscript', 'greek_alpha'].includes(glyph?.form);
+    const visualMatch = ['subscript', 'superscript', 'greek_alpha', 'greek'].includes(glyph?.form);
     const issue = flagged.find(entry => entry.quote === query);
     const state = glyph?.form === 'unclear' || (!record && verdict !== 'ok') || ['unresolved', 'ambiguous'].includes(verdict)
       ? 'pending' : visualMatch || verdict === 'ok' && record ? 'checked' : issue ? 'difference' : 'pending';
@@ -164,6 +226,38 @@ export function catalogReviewRows(block, section, items, glyphs, flagged) {
         : issue?.reason || item.notes?.join(' ') || item.reason || (state === 'checked' ? '对应到本地目录条目。' : '请对照原图核对目录写法。');
     return { title: query, box: sectionQuote(block, query)?.box ?? section.box, state, reason,
       reference: [catalog, record, source, name].filter(Boolean).join(' · '), issueId: issue?.id };
+  });
+}
+
+export function foodCatalogReviewRows(block, section, items) {
+  return items.map(({ query, parents = [], matches = [] }) => {
+    const title = [...parents, query].join(' › ');
+    const box = sectionQuote(block, query)?.box ?? section.box;
+    if (!matches.length) {
+      return {
+        title, box, state: 'checked',
+        reason: '未落入新食品原料/特殊添加剂受限索引，按普通食品原料对照原稿核实。',
+        reference: ''
+      };
+    }
+    const top = matches[0];
+    const alerts = [];
+    if (top.foodcate && /不包括|仅限|不得|限量|范围/.test(top.foodcate)) alerts.push(`适用范围：${top.foodcate.slice(0, 60)}`);
+    if (top.consumption && /≤|推荐|限量|天/.test(top.consumption)) alerts.push(`食用量提示：${top.consumption.slice(0, 50)}`);
+    const needsCheck = alerts.length > 0 || top.status === 'SPECIES MATCH' || top.status === 'FUZZY MATCH' || top.status === 'MULTIPLE MATCH';
+    const reason = alerts.length
+      ? `命中「${top.official_name}」：${alerts.join('；')}。请核对适用人群与警示标示。`
+      : top.status === 'SPECIES MATCH'
+        ? `菌种名匹配「${top.official_name}」，请对照原稿核对具体菌株号与适用类别。`
+        : top.status === 'EXACT MATCH'
+          ? `索引精确匹配「${top.official_name}」。`
+          : `索引返回相似候选「${top.official_name}」，请核对原稿写法与依据。`;
+    return {
+      title, box,
+      state: needsCheck ? 'pending' : 'checked',
+      reason,
+      reference: [top.catalog_type, top.basis, top.ins && `INS ${top.ins}`].filter(Boolean).join(' · ')
+    };
   });
 }
 
@@ -223,29 +317,74 @@ export function repairReview(sections, history, formula, targets) {
   return readsPending ? actions.filter(item => item.tool !== 'formula') : actions;
 }
 
-function petLabelHandoff(pages) {
+function matchFieldGroup(title, fields, pages, anchorPattern) {
   const lines = pages.flatMap(page => (page.lines ?? []).map(line => ({ ...line, pageId: page.id })));
-  const producer = /^(?:[【\[〖〔{])?(?:生产企业(?:名称)?|生产商|生产厂家|制造商|生产单位)(?:[】\]〗〕}:：]+)?[^:：]{2,70}(?:公司|工厂|厂|合作社)$/u;
-  const address = /^(?:[【\[〖〔{])?生产(?:注册)?地址(?:\(注册地址\))?[】\]〗〕}:：]+.{4,}$/u;
-  const date = /^(?:[【\[〖〔{])?生产日期(?:[】\]〗〕}:：(（年月日/]|见|\d)/u;
-  const anchor = lines.find(line => /生产许可|生产日期/u.test(compact(line.text)));
+  const anchor = anchorPattern ? lines.find(line => anchorPattern.test(compact(line.text))) : undefined;
   return {
-    title: '基础标识',
-    rows: [
-      ['生产企业名称', lines.find(line => producer.test(compact(line.text))),
-        '未从已识别的版面找到明确的生产企业名称。请查看完整背标，确认生产企业字段和全称。'],
-      ['生产地址', lines.find(line => address.test(compact(line.text))),
-        '未从已识别的版面找到明确的生产地址。请核对背标生产企业地址及其归属。'],
-      ['生产日期', lines.find(line => date.test(compact(line.text))),
-        '未从已识别的版面找到生产日期标示。请核对喷印区是否有日期字段、格式或见某处的说明。']
-    ].map(([title, found, missing]) => ({ title, state: found ? 'checked' : 'pending',
-      pageId: found?.pageId ?? anchor?.pageId ?? pages[0].id, box: (found ?? anchor)?.box,
-      reason: found ? `原稿识别到「${found.text}」，可定位查看。` : missing }))
+    title,
+    rows: fields.map(({ title: label, pattern, missing }) => {
+      const found = lines.find(line => pattern.test(compact(line.text)));
+      return {
+        title: label,
+        state: found ? 'checked' : 'pending',
+        pageId: found?.pageId ?? anchor?.pageId ?? pages[0]?.id,
+        box: (found ?? anchor)?.box,
+        reason: found ? `原稿识别到「${found.text}」，可定位查看。` : missing
+      };
+    })
   };
 }
 
+function petLabelHandoff(pages) {
+  return matchFieldGroup('基础标识', PET_PRODUCTION_FIELDS, pages, /生产许可|生产日期/u);
+}
+
+export function foodReviewHandoff(pages, formula, revision) {
+  const active = pages.filter(page => page.agentRun?.revision === revision);
+  const scanned = pages.filter(page => page.ocr === 'done' && page.lines?.length);
+  if (!active.length && !scanned.length) return [];
+  const sourcePages = active.length ? active : scanned;
+  const groups = [];
+  if (active.length) {
+    const catalogRows = active.flatMap(page =>
+      Object.values(page.agentRun.catalogRows ?? {}).flat().map(row => ({ ...row, pageId: page.id })));
+    if (catalogRows.length) groups.push({ title: '配料目录查证', rows: catalogRows });
+  }
+  if (formula?.rows?.length) {
+    const formulaRows = formula.rows.map((row, index) => {
+      const options = pages.map(page => page.formulaRows?.[index]).filter(Boolean);
+      const valid = options.filter(option => option.state !== 'pending');
+      const chosen = valid[0] ?? options.find(option => option.box) ?? options[0]
+        ?? { title: row.name, cell: row.cell, state: 'pending', reason: '尚未完成此行比对。' };
+      return chosen;
+    });
+    groups.push({ title: '配方活菌数', reference: formula.name, rows: formulaRows });
+  }
+  if (formula?.ingredients?.length) {
+    const ingredientRows = formula.ingredients.map((row, index) => {
+      const options = pages.map(page => page.formulaIngredients?.[index]).filter(Boolean);
+      return options.find(item => item.state === 'checked') ?? options[0]
+        ?? { title: row.name, cell: row.cell, expected: row.amount, state: 'pending', reason: '尚未核对此项配方配料。' };
+    });
+    groups.push({ title: '配方配料核对', reference: formula.name, rows: ingredientRows });
+  }
+  const claims = sourcePages.flatMap(page => page.formulaClaims ?? []);
+  if (claims.length) groups.push({ title: '活菌数声称', rows: claims });
+  const unread = pages.filter(page => page.ocr !== 'done' || !page.lines?.length);
+  if (unread.length) {
+    groups.push({
+      title: '未审版面',
+      rows: unread.map(page => ({
+        title: page.label, state: 'pending', pageId: page.id,
+        reason: page.ocr === 'blank' ? '此版面未识别到文字，请查看原稿。' : page.ocr === 'failed' ? '本机识别失败，可重试。' : '等待识别。'
+      }))
+    });
+  }
+  groups.push(matchFieldGroup('基础标识（GB 7718）', FOOD_LABEL_FIELDS, sourcePages, /生产许可|配料|净含量/u));
+  return groups;
+}
+
 export function petReviewHandoff(pages, formula, revision) {
-  if (!isPetProof(pages.flatMap(page => page.lines ?? []))) return [];
   const active = pages.filter(page => page.agentRun?.revision === revision);
   if (!active.length) return [];
   const grouped = petSections.map(title => {
@@ -266,7 +405,7 @@ export function petReviewHandoff(pages, formula, revision) {
     return group;
   });
   const additive = grouped[1].position;
-  const formulaRows = !formula ? [{ title: '关联配方表', reason: '未关联配方表，无法核对每克活菌数。', state: 'pending' }]
+  const formulaRows = !formula?.rows?.length ? [{ title: '关联配方表', reason: '未关联配方表，无法核对每克活菌数。', state: 'pending' }]
     : formula.rows.map((row, index) => {
       const options = pages.map(page => page.formulaRows?.[index]).filter(Boolean);
       const valid = options.filter(option => option.state !== 'pending');
@@ -279,11 +418,29 @@ export function petReviewHandoff(pages, formula, revision) {
     });
   const claims = active.flatMap(page => page.formulaClaims ?? []);
   const unread = pages.filter(page => page.ocr !== 'done' || !page.lines?.length || !active.includes(page));
+  const ingredientCheck = formula?.ingredients?.length ? [{
+    title: '配方配料核对',
+    reference: formula.name,
+    rows: formula.ingredients.map((row, index) => {
+      const options = pages.map(page => page.formulaIngredients?.[index]).filter(Boolean);
+      return options.find(item => item.state === 'checked') ?? options[0]
+        ?? { title: row.name, cell: row.cell, expected: row.amount, state: 'pending', reason: '尚未核对此项配方成分。' };
+    })
+  }] : [];
   return [...grouped, { title: '配方活菌数', reference: formula?.name, rows: formulaRows },
+    ...ingredientCheck,
     ...(!claims.length ? [] : [{ title: '活菌数声称', rows: claims }]), ...(!unread.length ? [] : [{
     title: '未审版面', rows: unread.map(page => ({ title: page.label, state: 'pending', pageId: page.id,
       reason: page.ocr === 'blank' ? '此版面未识别到文字，请查看原稿。' : page.ocr === 'failed' ? '本机识别失败，可重试。' : '尚未运行视觉预审。' }))
-  }]), petLabelHandoff(active)];
+  }]), petLabelHandoff(active), matchFieldGroup('其他法定标识', PET_EXTENDED_FIELDS, active, /生产许可|净含量|保质期/u)];
+}
+
+export function reviewHandoff(pages, formula, revision, categoryOverride = 'auto') {
+  const allLines = pages.flatMap(page => page.lines ?? []);
+  const category = resolveProofCategory(allLines, categoryOverride);
+  return category === 'pet'
+    ? petReviewHandoff(pages, formula, revision)
+    : foodReviewHandoff(pages, formula, revision);
 }
 
 export function evidenceTargets(lines) {
@@ -295,15 +452,22 @@ export function evidenceTargets(lines) {
       if (box) targets.push({ id: targets.length + 1, kind, index, quote, box });
     };
     for (const match of line.text.matchAll(missingExponent)) add('cfu', match[0]);
-    const boundary = /^(\d+(?:\.\d+)?)kg$/i.exec(compact(line.text));
+    const boundary = bareBoundaryWeight.exec(compact(line.text));
     if (!boundary) return;
-    const [x, y, w, h] = line.box;
-    const neighbors = lines.filter(other => other !== line
-      && Math.abs(other.box[1] + other.box[3] / 2 - y - h / 2) <= h * .65
-      && Math.abs(other.box[0] - x) < Math.max(w * 7, .06));
+    const [x, y, w, h] = readingBox(line);
+    const neighbors = lines.filter(other => {
+      if (other === line || (other.rotation === 180) !== (line.rotation === 180)) return false;
+      const [ox, oy, ow, oh] = readingBox(other);
+      const sameRow = Math.abs(oy + oh / 2 - y - h / 2) <= Math.max(h, oh) * .65
+        && Math.abs(ox - x) < Math.max(w * 7, .06);
+      const sameCol = Math.abs(ox + ow / 2 - x - w / 2) <= Math.max(w, ow) * 1.2
+        && Math.abs(oy - y) <= Math.max(h, oh) * 3.5;
+      return sameRow || sameCol;
+    });
     const middle = neighbors.find(other => {
-      const parts = /^(\d+(?:\.\d+)?)[-~～–](\d+(?:\.\d+)?)kg$/i.exec(compact(other.text));
-      return parts && Number(parts[2]) === Number(boundary[1]);
+      const parts = rangeWeight.exec(compact(other.text));
+      return parts && Number(parts[2]) === Number(boundary[1])
+        && parts[3].toLowerCase() === boundary[2].toLowerCase();
     });
     if (middle) add('weight', line.text.trim());
   });
@@ -400,9 +564,9 @@ export async function runEvidenceCheck(target, reread, readImage) {
     try {
       const text = await readImage();
       const values = observedValues(target, [{ text, box: target.box }]);
-      readings.push({ engine: 'MS_LLM 看原图', values });
+      readings.push({ engine: '视觉模型复读', values });
     } catch (error) {
-      readings.push({ engine: 'MS_LLM 看原图', values: [], error: error.message, optional: true });
+      readings.push({ engine: '视觉模型复读', values: [], error: error.message, optional: true });
     }
   }
   const confirmed = consensus();
@@ -415,7 +579,7 @@ export function evidenceFinding(reading, pageId) {
   const evidence = readings.map(({ engine, values, error }) => `${engine}：${values.join(' / ') || (error ? '复读失败' : '未读清')}`).join('。');
   const reason = kind === 'cfu'
     ? `${evidence}。请在原稿确认指数，再核算此项活菌数。`
-    : `${confirmed ? `两种识别均读为「${quote}」。` : `${evidence}。`}相邻两档涉及同一个体重边界，请确认比较符号与分档口径。`;
+    : `${confirmed ? `两种识别均读为「${quote}」。` : `${evidence}。`}相邻两档涉及同一个体重/分量边界，请确认比较符号与分档口径。`;
   return { id: `${pageId}-evidence-${index}-${kind}-${quote}`, pageId, source: 'agent', type: 'copy',
     title: kind === 'cfu' ? '复核活菌数指数' : '复核喂食体重分档', quote, box, boxes: [box], reason, status: 'pending', note: '' };
 }
@@ -436,7 +600,6 @@ export function retainedReviewIssues(issues, pageId, readings, clearedCatalog = 
   });
 }
 
-// Merge only corroborated numerals into a disposable copy for the deterministic spreadsheet comparison.
 export function recoveredCfuLines(lines, readings = []) {
   const recovered = lines.slice();
   for (const { kind, index, quote, confirmed, box } of readings) {
