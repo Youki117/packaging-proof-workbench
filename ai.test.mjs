@@ -1,38 +1,113 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { anchoredFindings, confirmCatalogGlyphs, modelReview, readProofText, reviewInput, visionReviewStep } from './ai.mjs';
+import { mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { anchoredFindings, configuredModel, confirmCatalogGlyphs, isLocalOrPrivateHost, modelReview, readProofText, reviewInput, visionReviewStep } from './ai.mjs';
+import { parseModelConfigObject } from './model-config.mjs';
 import { reviewCoverage, reviewSections } from './agent.mjs';
 
-test('catalog glyph confirmation looks at the crop and validates each returned form', async t => {
+test('model config supports MS_LLM, generic local/LAN multimodal, dedicated vision, and remote HTTPS models', async () => {
+  assert.equal(isLocalOrPrivateHost('127.0.0.1'), true);
+  assert.equal(isLocalOrPrivateHost('192.168.3.100'), true);
+  assert.equal(isLocalOrPrivateHost('172.16.0.5'), true);
+  assert.equal(isLocalOrPrivateHost('172.32.0.5'), false);
+  assert.equal(isLocalOrPrivateHost('api.openai.com'), false);
+
+  const dir = await mkdtemp(join(tmpdir(), 'workbench-cfg-'));
+  try {
+    const save = async (name, obj) => {
+      const path = join(dir, name);
+      await writeFile(path, JSON.stringify(obj), 'utf8');
+      return path;
+    };
+    const ms = await configuredModel(await save('ms.json', {
+      文本模型: { API地址: 'http://192.168.3.100:10830/v1/chat/completions', 模型名称: 'MS_LLM', API密钥: '' }
+    }));
+    assert.equal(ms.msLlm, true);
+    assert.equal(ms.isLocal, true);
+    assert.equal(ms.vision, true);
+    assert.equal(ms.visionEndpoint.model, 'MS_LLM');
+
+    const qwenLan = await configuredModel(await save('qwen.json', {
+      文本模型: { API地址: 'http://10.0.0.12:8000/v1/chat/completions', 模型名称: 'Qwen2.5-VL-72B', API密钥: '', 支持视觉: true }
+    }));
+    assert.equal(qwenLan.msLlm, false);
+    assert.equal(qwenLan.isLocal, true);
+    assert.equal(qwenLan.vision, true);
+
+    const split = await configuredModel(await save('split.json', {
+      文本模型: { API地址: 'https://api.example.com/v1/chat/completions', 模型名称: 'deepseek-chat', API密钥: 'k1' },
+      视觉模型: { API地址: 'https://ark.example.com/api/v3/chat/completions', 模型名称: 'doubao-vision', API密钥: 'k2', 最大输出Token: 4096 }
+    }));
+    assert.equal(split.isLocal, false);
+    assert.equal(split.vision, true);
+    assert.equal(split.visionEndpoint.model, 'doubao-vision');
+    assert.equal(split.visionEndpoint.maxTokens, 4096);
+    assert.equal(split.visionEndpoint.isLocal, false);
+
+    await assert.rejects(configuredModel(await save('bad-http.json', {
+      文本模型: { API地址: 'http://api.example.com/v1/chat/completions', 模型名称: 'gpt-4o', API密钥: 'k' }
+    })), /HTTPS/);
+    assert.throws(() => parseModelConfigObject({ 文本模型: { API地址: 'http://127.0.0.1:8000/v1', 模型名称: 'x', 支持视觉: 'yes' } }), /布尔值/);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('catalog glyph confirmation looks at the crop and validates each returned form including generalized greek/superscript', async t => {
   const image = 'data:image/jpeg;base64,/9j/AA==';
   const config = { msLlm: true, isLocal: true, model: 'MS_LLM' };
-  const crops = [{ kind: 'subscript', image }, { kind: 'alpha', image }];
-  let forms = ['subscript', 'latin_a'];
+  const crops = [
+    { kind: 'subscript', base: 'B', image },
+    { kind: 'alpha', image },
+    { kind: 'greek', expected: 'β', observed: 'b', image },
+    { kind: 'superscript', image }
+  ];
+  let forms = ['subscript', 'latin_a', 'greek', 'superscript'];
   t.mock.method(globalThis, 'fetch', async (_, options) => {
     const body = JSON.parse(options.body);
     assert.equal(body.response_format.type, 'json_object');
-    assert.equal(body.messages[0].content.filter(item => item.type === 'image_url').length, 2);
+    assert.equal(body.messages[0].content.filter(item => item.type === 'image_url').length, 4);
     return Response.json({ choices: [{ message: { content: JSON.stringify({ forms }) } }] });
   });
   assert.deepEqual(await confirmCatalogGlyphs(config, crops), forms);
-  forms = ['normal', 'subscript'];
+  forms = ['normal', 'subscript', 'greek', 'superscript'];
   await assert.rejects(confirmCatalogGlyphs(config, crops), /可验证的字形/);
 });
 
-test('image verification uses cropped text without supplying the OCR answer', async t => {
+test('image verification uses cropped text without supplying OCR answer and gates remote models on allowRemote', async t => {
   const image = 'data:image/jpeg;base64,/9j/AA==';
   const config = { msLlm: true, isLocal: true, model: 'MS_LLM' };
   let texts = ['青屿示例', '屿青示例'];
+  let expectedImages = 2;
   t.mock.method(globalThis, 'fetch', async (_, options) => {
     const content = JSON.parse(options.body).messages[0].content;
-    assert.equal(content.filter(item => item.type === 'image_url').length, 2);
+    assert.equal(content.filter(item => item.type === 'image_url').length, expectedImages);
     assert.ok(!content[0].text.includes('青屿示例'));
     return Response.json({ choices: [{ message: { content: JSON.stringify({ texts }) } }] });
   });
   assert.deepEqual(await readProofText(config, [image, image]), texts);
   texts = ['青屿示例'];
   await assert.rejects(readProofText(config, [image, image]), /复读格式/);
-  await assert.rejects(readProofText({ ...config, isLocal: false }, [image]), /本地 MS_LLM/);
+  await assert.rejects(readProofText({ ...config, isLocal: false }, [image]), /远程多模态模型/);
+  expectedImages = 1;
+  texts = ['青屿示例'];
+  assert.deepEqual(await readProofText({ ...config, isLocal: false, msLlm: false, vision: true }, [image], { allowRemote: true }), ['青屿示例']);
+});
+
+test('standard multimodal models omit MS_LLM-specific parameters', async t => {
+  const image = 'data:image/jpeg;base64,/9j/AA==';
+  const config = { url: new URL('https://api.example.com/v1/chat/completions'), isLocal: false, msLlm: false, vision: true, model: 'gpt-4o', key: 'secret', maxTokens: 4096 };
+  t.mock.method(globalThis, 'fetch', async (_, options) => {
+    const body = JSON.parse(options.body);
+    assert.equal(body.stream, false);
+    assert.equal(body.max_tokens, 4096);
+    assert.equal(body.reasoning_effort, undefined);
+    assert.equal(body.chat_template_kwargs, undefined);
+    return Response.json({ choices: [{ message: { content: JSON.stringify({ texts: ['OK'] }) } }] });
+  });
+  assert.deepEqual(await readProofText(config, [image], { allowRemote: true }), ['OK']);
 });
 
 test('visual glyph evidence blocks a duplicate typo even when the agent changes its category', async t => {
@@ -86,7 +161,7 @@ test('vision agent receives crop and tool evidence, and only runs grounded next 
   const close = await visionReviewStep(config, { overview, crops: [{ id: 1, image: overview }],
     history: [...history, { ...next.actions[0], data: { flagged: ['麦芽糊精'] } }] }, lines);
   assert.deepEqual(close.findings, []);
-  await assert.rejects(visionReviewStep({ ...config, isLocal: false }, { overview }, lines), /本地 MS_LLM/);
+  await assert.rejects(visionReviewStep({ ...config, isLocal: false }, { overview }, lines), /远程多模态模型/);
   await assert.rejects(visionReviewStep(config, { overview: 'https://example.com/packaging.jpg' }, lines), /稿件/);
   assert.equal(mock.mock.callCount(), 3);
 });
@@ -147,17 +222,17 @@ test('pet claims already covered by local rules keep the local wording', async t
   const lines = [
     '宠物益生菌',
     '优选5株专利菌',
-    '狗狗服用示例药物这类消炎止痛药期间'
+    '换粮过渡期连喂七天效果更佳'
   ].map((text, i) => ({ text, box: [.1, .1 + i * .05, .6, .03] }));
   const findings = [
     { type: 'claims', quote: '优选5株专利菌', first: 2, last: 2, reason: '需要核对专利数量。' },
     { type: 'copy', quote: '优选5株专利菌', first: 2, last: 2, reason: '仅对应4株。' },
-    { type: 'claims', quote: '狗狗服用示例药物', first: 3, last: 3, reason: '请复核用药相关宣传。' }
+    { type: 'claims', quote: '换粮过渡期连喂七天效果更佳', first: 3, last: 3, reason: '请复核效果宣称依据。' }
   ];
   t.mock.method(globalThis, 'fetch', async (_, options) => {
     assert.match(JSON.parse(options.body).messages[0].content, /人工审阅宠物饲料包装/);
     return Response.json({ choices: [{ message: { content: JSON.stringify({ findings }) } }] });
   });
   const result = await modelReview({ model: 'MS_LLM', msLlm: true }, lines);
-  assert.deepEqual(result.map(issue => issue.quote), ['狗狗服用示例药物']);
+  assert.deepEqual(result.map(issue => issue.quote), ['换粮过渡期连喂七天效果更佳']);
 });
